@@ -1,0 +1,43 @@
+# Environment
+.env
+.secrets
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs
+*.log
+scraping.log
+debug.log
+
+# Generated data files
+last_7_available_english_data.json
+violations_statistics.json
+failed_urls.json
+
+# Charts output
+charts/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temp files
+*.temp
+*.tmp
+*.bak
