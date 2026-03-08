@@ -12,7 +12,7 @@ on:
     - cron: '0 0 * * *'  # Run daily at midnight UTC
 
 permissions:
-  contents: write
+  contents: read
   issues: write
 
 jobs:
@@ -33,50 +33,26 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Create .env file
-      run: |
-        echo "MONGO_USER=${{ secrets.MONGO_USER }}" >> .env
-        echo "MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}" >> .env
-        echo "MONGO_URI=${{ secrets.MONGO_URI }}" >> .env
-        echo "MONGO_DB_NAME=${{ secrets.MONGO_DB_NAME }}" >> .env
-        echo "MONGO_COLLECTION_URLS=${{ secrets.MONGO_COLLECTION_URLS }}" >> .env
-
-    - name: Load .env file
-      uses: xom9ikk/dotenv@v2
-
     - name: Run scraper
       env:
-        MONGO_URI: ${{ secrets.MONGO_URI }}
-        MONGO_USER: ${{ secrets.MONGO_USER }}
-        MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
-        MONGO_DB_NAME: ${{ secrets.MONGO_DB_NAME }}
-        MONGO_COLLECTION_URLS: ${{ secrets.MONGO_COLLECTION_URLS }}
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
         MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       run: python main.py
 
-    - name: Check for changes
-      id: git-check
-      run: |
-        git status --porcelain
-        echo "changes=$(git status --porcelain)" >> $GITHUB_OUTPUT
+    - name: Ping Healthchecks.io (success)
+      if: success()
+      env:
+        HC_PING_URL: ${{ secrets.HC_PING_URL }}
+      run: curl -fsS -m 10 --retry 5 "$HC_PING_URL" > /dev/null
 
-    - name: Commit changes
-      if: steps.git-check.outputs.changes
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add .
-        git commit -m "Update data from daily scraper run"
-
-    - name: Push changes
-      if: steps.git-check.outputs.changes
-      uses: ad-m/github-push-action@master
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        branch: ${{ github.ref }}
+    - name: Ping Healthchecks.io (failure)
+      if: failure()
+      env:
+        HC_PING_URL: ${{ secrets.HC_PING_URL }}
+      run: curl -fsS -m 10 --retry 5 "$HC_PING_URL/fail" > /dev/null
 
     - name: Debug logs
-      if: ${{ inputs.debug_enabled }}
+      if: inputs.debug_enabled
       run: |
         echo "Debug logs enabled"
         cat debug.log || echo "No debug.log found"

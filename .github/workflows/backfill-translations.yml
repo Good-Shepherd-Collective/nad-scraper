@@ -5,12 +5,12 @@ on:
     inputs:
       limit:
         type: number
-        description: 'Max reports to process (0 = all)'
+        description: 'Max violations to process (0 = all)'
         required: false
         default: 0
       date:
         type: string
-        description: 'Single report date (YYYY.MM.DD), leave empty for batch'
+        description: 'Single report date (YYYY-MM-DD), leave empty for batch'
         required: false
         default: ''
       dry_run:
@@ -26,7 +26,7 @@ permissions:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # Just under 2 hours
+    timeout-minutes: 120
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
@@ -43,10 +43,7 @@ jobs:
 
     - name: Run backfill
       env:
-        MONGO_URI: ${{ secrets.MONGO_URI }}
-        MONGO_USER: ${{ secrets.MONGO_USER }}
-        MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
-        MONGO_DB_NAME: ${{ secrets.MONGO_DB_NAME }}
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
         MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
         INPUT_DATE: ${{ inputs.date }}
         INPUT_LIMIT: ${{ inputs.limit }}
@@ -56,7 +53,6 @@ jobs:
         if [ -n "$INPUT_DATE" ]; then
           ARGS="$ARGS --date $INPUT_DATE"
         fi
-        # For scheduled runs, inputs are empty so limit defaults to 0 (all)
         if [ -n "$INPUT_LIMIT" ] && [ "$INPUT_LIMIT" != "0" ]; then
           ARGS="$ARGS --limit $INPUT_LIMIT"
         fi
@@ -70,29 +66,6 @@ jobs:
     needs: backfill
     if: always()
     steps:
-    - name: Create completion issue
-      if: needs.backfill.result == 'success'
-      uses: actions/github-script@v6
-      with:
-        script: |
-          // Check if there's already an open completion issue
-          const issues = await github.rest.issues.listForRepo({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            state: 'open',
-            labels: 'backfill-complete'
-          });
-
-          if (issues.data.length === 0) {
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: 'Backfill Translation Run Completed',
-              body: `A backfill translation run completed successfully.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCheck the run logs for the summary (items translated, skipped, etc.).\n\n**Once all reports are backfilled, disable the cron schedule in \`.github/workflows/backfill-translations.yml\` by removing the \`schedule\` block.**`,
-              labels: ['backfill-complete', 'automated']
-            });
-          }
-
     - name: Create failure issue
       if: needs.backfill.result == 'failure'
       uses: actions/github-script@v6
@@ -111,7 +84,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `Backfill Translation Failed - ${date}`,
-              body: `The backfill translation workflow failed.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThe next scheduled run will retry automatically. Check the logs for errors.`,
+              body: `The backfill translation workflow failed.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCheck the logs for errors.`,
               labels: ['backfill-failure', 'automated']
             });
           }
