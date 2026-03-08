@@ -2,13 +2,11 @@ import os
 import requests
 from bs4 import BeautifulSoup
 import logging
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from pymongo.server_api import ServerApi
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from db import get_mongo_client, MONGO_DB_NAME
+from db import get_existing_url_dates, insert_urls
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,20 +14,6 @@ logger = logging.getLogger(__name__)
 
 session = requests.Session()
 
-MONGO_COLLECTION = os.getenv("MONGO_COLLECTION_URLS", "Urls")
-
-# Create MongoDB client
-try:
-    logger.info("Attempting to create MongoDB client...")
-    client = get_mongo_client(server_api=ServerApi('1'), serverSelectionTimeoutMS=5000)
-    logger.info("MongoDB client created. Attempting to ping...")
-    client.admin.command('ping')
-    logger.info("Successfully connected to MongoDB!")
-    db = client[MONGO_DB_NAME]
-    collection = db[MONGO_COLLECTION]
-except Exception as e:
-    logger.error(f"Failed to connect to MongoDB: {str(e)}")
-    raise
 
 def scrape_page(url):
     logger.info(f"Scraping URL: {url}")
@@ -56,7 +40,7 @@ def scrape_page(url):
                 if date_div:
                     date_span = date_div.find('span', class_='date-display-single')
                     if date_span and 'content' in date_span.attrs:
-                        date_str = date_span['content'].split('T')[0]  # Extract date part
+                        date_str = date_span['content'].split('T')[0]
 
                         logger.info(f"Extracted: Title: {title}, Date: {date_str}, Link: {full_link}")
                         results[date_str] = {'title': title, 'link': full_link}
@@ -71,6 +55,7 @@ def scrape_page(url):
 
     logger.info(f"Scraped {len(results)} items from {url}")
     return results
+
 
 def scrape_all_pages(start_page=None, end_page=0, existing_dates=None):
     base_url = 'https://www.nad.ps/ar/violations-reports/daily-report'
@@ -100,35 +85,19 @@ def scrape_all_pages(start_page=None, end_page=0, existing_dates=None):
 
     return all_data
 
-def get_existing_dates():
-    return set(collection.distinct('date'))
-
-def upload_to_mongodb(data, existing_dates):
-    new_items = 0
-    for date, item in data.items():
-        if date not in existing_dates:
-            document = {
-                "date": date,
-                "title": item['title'],
-                "link": item['link']
-            }
-            collection.insert_one(document)
-            new_items += 1
-
-    logger.info(f"Uploaded {new_items} new items to MongoDB")
 
 def main():
     logger.info("Starting scraping process for all pages")
 
     try:
-        existing_dates = get_existing_dates()
-        logger.info(f"Found {len(existing_dates)} existing dates in MongoDB")
+        existing_dates = get_existing_url_dates()
+        logger.info(f"Found {len(existing_dates)} existing dates in database")
 
         data = scrape_all_pages(start_page=4, existing_dates=existing_dates)
 
-        upload_to_mongodb(data, existing_dates)
+        new_count = insert_urls(data)
 
-        logger.info(f"Scraped a total of {len(data)} items, uploaded only new items to MongoDB")
+        logger.info(f"Scraped a total of {len(data)} items, inserted {new_count} new URLs")
     except Exception as e:
         logger.error(f"An error occurred during execution: {str(e)}")
         raise

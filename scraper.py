@@ -9,7 +9,7 @@ import signal
 from dotenv import load_dotenv
 from translations import normalize_translation, CUSTOM_TRANSLATIONS
 from minimax_translate import translate_with_minimax, translate_batch
-from db import get_db
+from db import get_unscraped_urls, insert_report, create_ingestion_entry, update_ingestion_entry
 
 # Load environment variables from .env file (no-op if vars already set, e.g. in CI)
 load_dotenv()
@@ -24,9 +24,6 @@ handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-
-# Setup MongoDB client
-db = get_db()
 
 
 # Function to handle failed URLs
@@ -110,31 +107,6 @@ def parse_report_date(title):
     day = day.zfill(2)
 
     return f"{year}.{month}.{day}"
-
-
-# Function to get unscraped URLs from MongoDB using server-side aggregation
-def get_unscraped_urls_from_mongodb():
-    try:
-        urls_collection = db['Urls']
-
-        pipeline = [
-            {"$group": {"_id": "$link"}},
-            {"$lookup": {
-                "from": "new_daily_reports",
-                "localField": "_id",
-                "foreignField": "Source URL",
-                "as": "report"
-            }},
-            {"$match": {"report": {"$size": 0}}},
-            {"$project": {"_id": 1}}
-        ]
-
-        unscraped_urls = [doc["_id"] for doc in urls_collection.aggregate(pipeline)]
-        logger.info(f"Found {len(unscraped_urls)} unscraped URLs (server-side lookup).")
-        return unscraped_urls
-    except Exception as e:
-        logger.error(f"Failed to fetch unscraped URLs from MongoDB. Error: {str(e)}")
-        return []
 
 
 # Function to extract Highcharts data from HTML (replaces Selenium)
@@ -326,29 +298,8 @@ def restructure_data(nad_data, custom_translations):
     return violations
 
 
-# Function to upload data to MongoDB
-def upload_to_mongodb(data, url):
-    try:
-        collection = db["new_daily_reports"]
-
-        data['Source URL'] = url
-        result = collection.update_one(
-            {"Report Title Arabic": data["Report Title Arabic"]},
-            {"$setOnInsert": data},
-            upsert=True
-        )
-
-        if result.upserted_id:
-            logger.info(f"Data successfully uploaded to MongoDB for URL: {url}")
-        else:
-            logger.info(f"Record for '{data['Report Title Arabic']}' already exists in MongoDB. Skipping insertion.")
-
-    except Exception as e:
-        logger.error(f"Failed to upload data to MongoDB for URL {url}. Error: {str(e)}")
-
-
 # Function to process each URL (no Selenium required)
-def process_url(url):
+def process_url(url, ingestion_id=None):
     logger.info(f'Starting scraping process for URL: {url}')
 
     custom_translations = CUSTOM_TRANSLATIONS
@@ -423,7 +374,7 @@ def process_url(url):
         else:
             logger.warning('Failed to scrape NAD page data')
 
-        upload_to_mongodb(scraped_data, url)
+        insert_report(scraped_data, url, ingestion_id=ingestion_id)
 
     except Exception as e:
         logger.error(f"An unexpected error occurred while processing URL {url}: {str(e)}")
@@ -436,25 +387,33 @@ def process_url(url):
 def main():
     try:
         logger.info('Starting the main process.')
-        url_list = get_unscraped_urls_from_mongodb()
+        url_list = get_unscraped_urls()
         if not url_list:
             logger.info("No new URLs to process. Exiting.")
             return
 
         logger.info(f"Processing {len(url_list)} URLs.")
 
+        ingestion_id = create_ingestion_entry()
+        records_added = 0
+        errors = 0
+
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
-                executor.submit(process_url, url): url
+                executor.submit(process_url, url, ingestion_id): url
                 for url in url_list
             }
             for i, future in enumerate(as_completed(futures), 1):
                 url = futures[future]
                 try:
                     future.result()
+                    records_added += 1
                     logger.info(f"Completed URL {i}/{len(url_list)}: {url}")
                 except Exception as e:
+                    errors += 1
                     logger.error(f"URL {i}/{len(url_list)} failed: {url} - {e}")
+
+        update_ingestion_entry(ingestion_id, records_added=records_added, errors=errors)
 
     except Exception as e:
         logger.error(f"An unexpected error occurred in the main function: {str(e)}")

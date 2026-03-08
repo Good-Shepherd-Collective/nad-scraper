@@ -4,7 +4,7 @@ Daily Reports Scraper - Entry Point
 
 This script orchestrates the daily scraping workflow:
 1. Collect new report URLs from NAD website
-2. Process all unscraped URLs and store in MongoDB
+2. Process all unscraped URLs and store in Neon Postgres
 """
 
 import sys

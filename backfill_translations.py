@@ -2,9 +2,8 @@
 """
 Backfill existing description_english fields with MiniMax M2.5 translations.
 
-Uses a single shared thread pool to translate items across multiple reports
-concurrently. Items already marked translation_source="minimax" are skipped
-on re-runs.
+Reads violations from Postgres that don't yet have translation_source='minimax',
+translates them, and updates in place.
 """
 
 import argparse
@@ -16,56 +15,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import psycopg
+from psycopg.rows import dict_row
+
 from minimax_translate import translate_batch
-from db import get_db
 
 DEFAULT_WORKERS = 100
 BATCH_SIZE = 10  # items per API call
-MAX_RUNTIME_SECONDS = 110 * 60  # 110 min — exit gracefully before the 120-min job timeout
+MAX_RUNTIME_SECONDS = 110 * 60  # 110 min
 
 
 def translate_batch_items(batch):
-    """Translate a batch of (index, arabic_text) tuples. Returns list of (index, translation, success)."""
-    indices = [b[0] for b in batch]
+    """Translate a batch of (id, arabic_text) tuples. Returns list of (id, translation, success)."""
+    ids = [b[0] for b in batch]
     texts = [b[1] for b in batch]
 
     translations = translate_batch(texts)
 
     results = []
-    for idx, original, translated in zip(indices, texts, translations):
+    for vid, original, translated in zip(ids, texts, translations):
         success = translated != original
-        results.append((idx, translated, success))
+        results.append((vid, translated, success))
     return results
-
-
-def prepare_report(report):
-    """Extract items needing translation from a report. Returns (to_translate, skipped)."""
-    narrative_data = report.get("narrative_data", [])
-    if not narrative_data:
-        return [], 0
-
-    to_translate = []
-    skipped = 0
-
-    for j, item in enumerate(narrative_data):
-        arabic = item.get("description_arabic", "")
-        if not arabic or not arabic.strip():
-            skipped += 1
-            continue
-        if item.get("translation_source") == "minimax":
-            skipped += 1
-            continue
-        to_translate.append((j, arabic))
-
-    return to_translate, skipped
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Backfill description_english with MiniMax translations"
     )
-    parser.add_argument("--date", help="Process a single report by date (YYYY.MM.DD)")
-    parser.add_argument("--limit", type=int, help="Max number of reports to process")
+    parser.add_argument("--date", help="Process violations from a single report date (YYYY-MM-DD)")
+    parser.add_argument("--limit", type=int, help="Max number of violations to process")
     parser.add_argument("--dry-run", action="store_true", help="Print only, no DB writes")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"Concurrent API calls (default: {DEFAULT_WORKERS})")
@@ -74,145 +53,95 @@ def main():
     args = parser.parse_args()
     batch_size = args.batch_size
 
-    db = get_db()
-    collection = db["new_daily_reports"]
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        print("DATABASE_URL not set")
+        sys.exit(1)
 
-    # Build query
-    query = {}
+    conn = psycopg.connect(database_url, row_factory=dict_row)
+
+    # Find violations needing translation
+    query = """
+        SELECT v.id, v.description_arabic
+        FROM nad_narrative_violations v
+        JOIN nad_reports r ON r.id = v.report_id
+        WHERE v.description_arabic IS NOT NULL
+          AND v.description_arabic != ''
+          AND (v.translation_source IS NULL OR v.translation_source != 'minimax')
+    """
+    params = []
     if args.date:
-        query["Date"] = args.date
-
-    # Load all report IDs upfront to avoid cursor timeout (CursorNotFound)
-    id_cursor = collection.find(query, {"_id": 1})
+        query += " AND r.report_date = %s"
+        params.append(args.date)
     if args.limit:
-        id_cursor = id_cursor.limit(args.limit)
-    report_ids = [doc["_id"] for doc in id_cursor]
+        query += f" LIMIT {args.limit}"
 
-    print(f"Starting backfill: {args.workers} workers, {batch_size} items/batch...")
-    print(f"  Found {len(report_ids)} reports to process.")
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        to_translate = [(row["id"], row["description_arabic"]) for row in cur.fetchall()]
+
+    print(f"Found {len(to_translate)} violations needing translation")
     if args.dry_run:
-        print("[DRY RUN] No changes will be written to the database.")
-    print()
+        print("[DRY RUN] No changes will be written.")
+
+    if not to_translate:
+        print("Nothing to do.")
+        conn.close()
+        return
 
     total_translated = 0
-    total_skipped = 0
-    reports_processed = 0
+    total_failed = 0
     start_time = time.time()
-    stopped_early = False
 
-    projection = {"_id": 1, "Date": 1, "narrative_data": 1}
-
-    # Process reports in chunks — submit all batches from multiple reports
-    # into a single shared pool so all 100 workers stay busy
-    REPORT_CHUNK = 20  # process 20 reports at a time
-    i = 0
+    # Split into batches and process concurrently
+    batches = [to_translate[i:i + batch_size] for i in range(0, len(to_translate), batch_size)]
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        while i < len(report_ids):
+        futures = {pool.submit(translate_batch_items, batch): i for i, batch in enumerate(batches)}
+
+        for future in as_completed(futures):
             if time.time() - start_time >= MAX_RUNTIME_SECONDS:
-                stopped_early = True
-                print(f"\n  ** Reached {MAX_RUNTIME_SECONDS // 60}-min runtime limit, "
-                      f"stopping gracefully. Next run will continue. **\n")
+                print(f"\n** Reached {MAX_RUNTIME_SECONDS // 60}-min runtime limit. Will resume on next run. **")
                 break
 
-            # Grab the next chunk of reports
-            chunk_ids = report_ids[i:i + REPORT_CHUNK]
-            i += REPORT_CHUNK
+            try:
+                results = future.result()
+                for vid, translated, success in results:
+                    if success and not args.dry_run:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE nad_narrative_violations
+                                SET description_english = %s, translation_source = 'minimax'
+                                WHERE id = %s
+                                """,
+                                (translated, vid),
+                            )
+                        total_translated += 1
+                    elif success:
+                        total_translated += 1
+                    else:
+                        total_failed += 1
+            except Exception as e:
+                total_failed += 1
+                print(f"  Batch error: {e}")
 
-            # Fetch and prepare all reports in this chunk
-            # Each entry: (report, narrative_data, to_translate, skipped)
-            chunk_reports = []
-            for rid in chunk_ids:
-                report = collection.find_one({"_id": rid}, projection)
-                if not report:
-                    continue
-                to_translate, skipped = prepare_report(report)
-                total_skipped += skipped
-                if not to_translate:
-                    reports_processed += 1
-                    continue
-                chunk_reports.append((report, to_translate))
-
-            if not chunk_reports:
-                continue
-
-            # Submit ALL batches from ALL reports in this chunk to the pool
-            # future -> (report_index, batch)
-            futures = {}
-            for cr_idx, (report, to_translate) in enumerate(chunk_reports):
-                batches = [
-                    to_translate[b:b + batch_size]
-                    for b in range(0, len(to_translate), batch_size)
-                ]
-                for batch in batches:
-                    fut = pool.submit(translate_batch_items, batch)
-                    futures[fut] = cr_idx
-
-            # Collect results grouped by report
-            report_results = {idx: {} for idx in range(len(chunk_reports))}
-            report_translated = {idx: 0 for idx in range(len(chunk_reports))}
-            report_failed = {idx: 0 for idx in range(len(chunk_reports))}
-
-            for future in as_completed(futures):
-                cr_idx = futures[future]
-                try:
-                    batch_results = future.result()
-                    for idx, new_text, success in batch_results:
-                        if success:
-                            report_results[cr_idx][idx] = new_text
-                            report_translated[cr_idx] += 1
-                        else:
-                            report_failed[cr_idx] += 1
-                except Exception:
-                    report_failed[cr_idx] += 1
-
-            # Write results back to DB per report
-            for cr_idx, (report, _) in enumerate(chunk_reports):
-                results = report_results[cr_idx]
-                translated = report_translated[cr_idx]
-                failed = report_failed[cr_idx]
-                report_date = report.get("Date", "Unknown")
-                narrative_data = report["narrative_data"]
-
-                if results and not args.dry_run:
-                    for idx, new_text in results.items():
-                        narrative_data[idx]["description_english"] = new_text
-                        narrative_data[idx]["translation_source"] = "minimax"
-                    collection.update_one(
-                        {"_id": report["_id"]},
-                        {"$set": {"narrative_data": narrative_data}},
-                    )
-
-                total_translated += translated
-                reports_processed += 1
-
-                status = "[DRY RUN] " if args.dry_run else ""
-                warn = f", {failed} failed" if failed else ""
-                print(f"  {status}{report_date}: {translated} translated{warn}")
-
-            if reports_processed % 100 < REPORT_CHUNK:
+            if total_translated % 100 < batch_size:
                 elapsed = time.time() - start_time
                 rate = total_translated / elapsed if elapsed > 0 else 0
-                print(f"\n  --- Progress: {reports_processed} reports | "
-                      f"{total_translated} translated | "
-                      f"{rate:.0f} items/sec | "
-                      f"{elapsed:.0f}s elapsed ---\n")
+                print(f"  Progress: {total_translated} translated, {total_failed} failed, {rate:.0f}/sec")
+
+    if not args.dry_run:
+        conn.commit()
+    conn.close()
 
     elapsed = time.time() - start_time
     print(f"\n{'=' * 50}")
-    print(f"Summary:")
-    print(f"  Reports processed:  {reports_processed}")
-    print(f"  Translated:         {total_translated}")
-    print(f"  Skipped:            {total_skipped}")
-    print(f"  Time elapsed:       {elapsed:.0f}s ({elapsed/60:.1f} min)")
-    if total_translated > 0:
-        print(f"  Avg rate:           {total_translated / elapsed:.1f} items/sec")
-    if stopped_early:
-        print(f"  Status:             Stopped early (will resume on next run)")
-    else:
-        print(f"  Status:             Complete")
+    print(f"Translated: {total_translated}")
+    print(f"Failed:     {total_failed}")
+    print(f"Time:       {elapsed:.0f}s ({elapsed/60:.1f} min)")
     if args.dry_run:
-        print(f"  [DRY RUN] No changes were written.")
+        print("[DRY RUN] No changes written.")
 
 
 if __name__ == "__main__":
