@@ -47,7 +47,7 @@ def insert_urls(url_data):
     """Insert new URLs into the urls table.
 
     Args:
-        url_data: dict of {date: {title, link}} from scrape_all_pages
+        url_data: dict of {link: {date, title, link}} from scrape_all_pages
     """
     if not url_data:
         return 0
@@ -55,14 +55,14 @@ def insert_urls(url_data):
     new_count = 0
     with get_conn() as conn:
         with conn.cursor() as cur:
-            for date, item in url_data.items():
+            for link, item in url_data.items():
                 cur.execute(
                     """
                     INSERT INTO urls (date, title, link)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (link) DO NOTHING
                     """,
-                    (date, item["title"], item["link"]),
+                    (item["date"], item["title"], item["link"]),
                 )
                 if cur.rowcount > 0:
                     new_count += 1

@@ -12,49 +12,13 @@ Usage:
 """
 
 import os
-import re
 import sys
 import argparse
-import requests
 from dotenv import load_dotenv
-from translations import CUSTOM_TRANSLATIONS
 from db import get_conn
+from minimax_translate import translate_with_minimax as _translate_minimax
 
 load_dotenv()
-
-MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
-MINIMAX_API_URL = "https://api.minimax.io/v1/chat/completions"
-
-PLACE_NAMES = {
-    arabic: english
-    for arabic, english in CUSTOM_TRANSLATIONS.items()
-    if arabic in (
-        'القدس', 'رام الله', 'جنين', 'طوباس', 'طولكرم', 'قلقيلية',
-        'نابلس', 'سلفيت', 'أريحا', 'بيت لحم', 'الخليل',
-        'شمال غزة', 'غزة', 'الوسطى', 'خانيونس', 'رفح',
-        'الضفة الغربية', 'قطاع غزة',
-    )
-}
-
-SYSTEM_PROMPT = f"""You are a professional Arabic-to-English translator specializing in human rights reporting from Palestine.
-
-RULES:
-1. Use ACTIVE VOICE always. Write "Israeli forces raided" not "the village was raided by forces".
-2. Preserve ALL facts exactly: times, dates, names, numbers, locations.
-3. Use past tense throughout.
-4. Write clear, direct, journalistic English. No commentary or editorializing.
-5. Use natural English word order.
-6. Standardized terminology:
-   - "Israeli forces" (not "the occupation forces")
-   - "settlers" (not "colonists")
-   - "raided" or "stormed" for اقتحم
-   - "arrested" or "detained" for اعتقل
-   - "checkpoint" for حاجز
-   - "settlement" for مستوطنة
-7. Correct place name mappings:
-{chr(10).join(f'   - {arabic} → {english}' for arabic, english in PLACE_NAMES.items())}
-
-Translate the following Arabic text to English. Return ONLY the translation, no explanations."""
 
 
 def get_report_violations(date=None):
@@ -117,29 +81,13 @@ def select_diverse_samples(violations, sample_size):
 
 
 def translate_with_minimax(arabic_text):
-    """Translate Arabic text using MiniMax M2.5 API."""
-    headers = {
-        "Authorization": f"Bearer {MINIMAX_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "MiniMax-M2.5",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": arabic_text},
-        ],
-        "temperature": 0.3,
-    }
+    """Translate Arabic text using the shared minimax_translate module.
 
-    resp = requests.post(MINIMAX_API_URL, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-
-    raw = data["choices"][0]["message"]["content"].strip()
-    translation = re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip()
-    usage = data.get("usage", {})
-
-    return translation, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+    Returns (translation, 0, 0) -- token counts are not tracked by the shared module,
+    but the interface is kept for compatibility with the test output format.
+    """
+    translation = _translate_minimax(arabic_text)
+    return translation, 0, 0
 
 
 def main():
@@ -151,7 +99,7 @@ def main():
     if not os.getenv("DATABASE_URL"):
         print("Error: DATABASE_URL not set.")
         sys.exit(1)
-    if not MINIMAX_API_KEY:
+    if not os.getenv("MINIMAX_API_KEY"):
         print("Error: MINIMAX_API_KEY not set.")
         sys.exit(1)
 

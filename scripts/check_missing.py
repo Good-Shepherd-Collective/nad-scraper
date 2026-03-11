@@ -16,18 +16,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from db import get_conn, get_unscraped_urls
+from db import get_conn, get_existing_url_dates, get_unscraped_urls
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-
-def get_all_url_dates():
-    """Get all dates from the urls table."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT date FROM urls")
-            return {row[0] for row in cur.fetchall()}
 
 
 def find_missing_dates(url_dates, start_date, end_date):
@@ -66,7 +58,7 @@ def main():
 
     logger.info(f"Checking date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
-    url_dates = get_all_url_dates()
+    url_dates = get_existing_url_dates()
     logger.info(f"Total dates in urls table: {len(url_dates)}")
 
     missing_dates = find_missing_dates(url_dates, start_date, end_date)

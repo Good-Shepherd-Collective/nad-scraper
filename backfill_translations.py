@@ -7,33 +7,26 @@ translates them, and updates in place.
 """
 
 import argparse
-import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
 
-load_dotenv()
-
-import psycopg
 from psycopg.rows import dict_row
 
+from db import get_conn
 from minimax_translate import translate_batch
 
-DEFAULT_WORKERS = 100
+DEFAULT_WORKERS = 10
 BATCH_SIZE = 10  # items per API call
 MAX_RUNTIME_SECONDS = 110 * 60  # 110 min
 
 
 def translate_batch_items(batch):
     """Translate a batch of (id, arabic_text) tuples. Returns list of (id, translation, success)."""
-    ids = [b[0] for b in batch]
     texts = [b[1] for b in batch]
-
     translations = translate_batch(texts)
 
     results = []
-    for vid, original, translated in zip(ids, texts, translations):
+    for (vid, original), translated in zip(batch, translations):
         success = translated != original
         results.append((vid, translated, success))
     return results
@@ -53,13 +46,6 @@ def main():
     args = parser.parse_args()
     batch_size = args.batch_size
 
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        print("DATABASE_URL not set")
-        sys.exit(1)
-
-    conn = psycopg.connect(database_url, row_factory=dict_row)
-
     # Find violations needing translation
     query = """
         SELECT v.id, v.description_arabic
@@ -74,11 +60,13 @@ def main():
         query += " AND r.report_date = %s"
         params.append(args.date)
     if args.limit:
-        query += f" LIMIT {args.limit}"
+        query += " LIMIT %s"
+        params.append(args.limit)
 
-    with conn.cursor() as cur:
-        cur.execute(query, params)
-        to_translate = [(row["id"], row["description_arabic"]) for row in cur.fetchall()]
+    with get_conn(row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            to_translate = [(row["id"], row["description_arabic"]) for row in cur.fetchall()]
 
     print(f"Found {len(to_translate)} violations needing translation")
     if args.dry_run:
@@ -86,7 +74,6 @@ def main():
 
     if not to_translate:
         print("Nothing to do.")
-        conn.close()
         return
 
     total_translated = 0
@@ -95,6 +82,9 @@ def main():
 
     # Split into batches and process concurrently
     batches = [to_translate[i:i + batch_size] for i in range(0, len(to_translate), batch_size)]
+
+    # Collect all results first, then write to DB in a single thread
+    all_results = []
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(translate_batch_items, batch): i for i, batch in enumerate(batches)}
@@ -107,18 +97,8 @@ def main():
             try:
                 results = future.result()
                 for vid, translated, success in results:
-                    if success and not args.dry_run:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE nad_narrative_violations
-                                SET description_english = %s, translation_source = 'minimax'
-                                WHERE id = %s
-                                """,
-                                (translated, vid),
-                            )
-                        total_translated += 1
-                    elif success:
+                    if success:
+                        all_results.append((vid, translated))
                         total_translated += 1
                     else:
                         total_failed += 1
@@ -131,9 +111,19 @@ def main():
                 rate = total_translated / elapsed if elapsed > 0 else 0
                 print(f"  Progress: {total_translated} translated, {total_failed} failed, {rate:.0f}/sec")
 
-    if not args.dry_run:
-        conn.commit()
-    conn.close()
+    # Write all results to DB in a single connection (thread-safe)
+    if all_results and not args.dry_run:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    UPDATE nad_narrative_violations
+                    SET description_english = %s, translation_source = 'minimax'
+                    WHERE id = %s
+                    """,
+                    [(translated, vid) for vid, translated in all_results],
+                )
+            conn.commit()
 
     elapsed = time.time() - start_time
     print(f"\n{'=' * 50}")

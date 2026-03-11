@@ -18,7 +18,7 @@ session = requests.Session()
 def scrape_page(url):
     logger.info(f"Scraping URL: {url}")
     try:
-        response = session.get(url)
+        response = session.get(url, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch URL: {url}. Error: {e}")
@@ -43,7 +43,7 @@ def scrape_page(url):
                         date_str = date_span['content'].split('T')[0]
 
                         logger.info(f"Extracted: Title: {title}, Date: {date_str}, Link: {full_link}")
-                        results[date_str] = {'title': title, 'link': full_link}
+                        results[full_link] = {'date': date_str, 'title': title, 'link': full_link}
                     else:
                         logger.warning(f"Could not extract date for title: {title}")
                 else:
@@ -77,7 +77,8 @@ def scrape_all_pages(start_page=None, end_page=0, existing_dates=None):
     # Merge results in order; early-exit if all dates on a page already exist
     for url, future in futures:
         page_data = future.result()
-        if page_data and existing_dates and all(d in existing_dates for d in page_data):
+        page_dates = {item['date'] for item in page_data.values()} if page_data else set()
+        if page_data and existing_dates and page_dates.issubset(existing_dates):
             logger.info(f"All dates on {url} already exist in DB. Stopping early.")
             break
         all_data.update(page_data)

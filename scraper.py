@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import os
@@ -14,8 +15,15 @@ from db import get_unscraped_urls, insert_report, create_ingestion_entry, update
 # Load environment variables from .env file (no-op if vars already set, e.g. in CI)
 load_dotenv()
 
-# Reusable session for connection pooling across same-host requests
-session = requests.Session()
+# Thread-local sessions for connection pooling (requests.Session is not thread-safe)
+_thread_local = threading.local()
+
+
+def _get_session():
+    """Return a thread-local requests.Session instance."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -24,6 +32,10 @@ handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+
+# Lock for thread-safe file writes
+_failed_urls_lock = threading.Lock()
 
 
 # Function to handle failed URLs
@@ -35,44 +47,35 @@ def write_failed_url(url, error):
     }
     filename = 'failed_urls.json'
 
-    try:
-        if os.path.exists(filename):
-            with open(filename, 'r+') as file:
-                try:
-                    data = json.load(file)
-                except json.JSONDecodeError:
-                    data = []
-                data.append(failed_url)
-                file.seek(0)
-                json.dump(data, file, indent=2)
-                file.truncate()
-        else:
-            with open(filename, 'w') as file:
-                json.dump([failed_url], file, indent=2)
+    with _failed_urls_lock:
+        try:
+            try:
+                with open(filename, 'r') as f:
+                    data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                data = []
+            data.append(failed_url)
+            with open(filename, 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.info(f"Failed URL written to {filename}: {url}")
+        except Exception as e:
+            logger.error(f"Error writing failed URL to file: {str(e)}")
 
-        logger.info(f"Failed URL written to {filename}: {url}")
-    except Exception as e:
-        logger.error(f"Error writing failed URL to file: {str(e)}")
+
+# Flag for graceful shutdown
+_shutdown_requested = False
 
 
 # Function to handle signals for graceful shutdown
 def signal_handler(sig, frame):
-    logger.info("Interrupt received, stopping workers.")
-    logger.info("Graceful shutdown complete.")
+    global _shutdown_requested
+    _shutdown_requested = True
+    logger.info("Interrupt received, shutting down after current tasks complete.")
 
 
 # Register the signal handler
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
-
-
-# Function to translate text using MiniMax (replaces googletrans)
-def translate_text(text, dest='en'):
-    try:
-        return translate_with_minimax(text)
-    except Exception as e:
-        logger.error(f"Translation error: {e}")
-        return text
 
 
 # Function to parse report date from title
@@ -92,9 +95,10 @@ def parse_report_date(title):
     if not year.isdigit() or len(year) != 4:
         raise ValueError(f"Invalid year in title: {title}")
 
-    # Find the month in the title
+    # Find the month in the title (match longest key first to avoid
+    # partial matches, e.g. 'تشرين الأول' vs 'تشرين الثاني')
     month = None
-    for key in months.keys():
+    for key in sorted(months.keys(), key=len, reverse=True):
         if key in title:
             month = months[key]
             break
@@ -146,7 +150,7 @@ def scrape_nad_page(url, html_content=None, soup=None):
     if soup is None:
         if html_content is None:
             try:
-                response = requests.get(url)
+                response = _get_session().get(url, timeout=30)
                 response.raise_for_status()
                 html_content = response.text
                 logger.info(f"Successfully fetched the page. Status code: {response.status_code}")
@@ -225,7 +229,7 @@ def scrape_alternative_structure(main_content):
             violation_type = violation_type_div.text.strip()
             description = description_div.find('p').text.strip() if description_div.find('p') else ""
 
-            logging.info(f"Found violation - Type: {violation_type}")
+            logger.info(f"Found violation - Type: {violation_type}")
             data["Alternative Structure"].append({
                 'type': violation_type,
                 'description': description
@@ -237,10 +241,10 @@ def scrape_alternative_structure(main_content):
 def restructure_data(nad_data, custom_translations):
     violations = []
     for region, governorates in nad_data.items():
-        region_english = custom_translations.get(region, translate_text(region))
+        region_english = custom_translations.get(region, translate_with_minimax(region))
         region_english = normalize_translation(region_english)
         for governorate, incidents in governorates.items():
-            governorate_english = custom_translations.get(governorate, translate_text(governorate))
+            governorate_english = custom_translations.get(governorate, translate_with_minimax(governorate))
             governorate_english = normalize_translation(governorate_english)
             for incident in incidents:
                 incident_type = custom_translations.get(incident['type'], incident['type'])
@@ -289,11 +293,11 @@ def restructure_data(nad_data, custom_translations):
             violations[idx]['description_english'] = translated_text
             violations[idx]['translation_source'] = 'minimax'
 
-    # Fill in empty descriptions
+    # Fill in empty descriptions (no translation was performed)
     for v in violations:
         if 'description_english' not in v:
             v['description_english'] = ''
-            v['translation_source'] = 'minimax'
+            v['translation_source'] = None
 
     return violations
 
@@ -306,7 +310,7 @@ def process_url(url, ingestion_id=None):
 
     try:
         # Fetch the page once, reuse for both chart and narrative extraction
-        response = session.get(url, timeout=30)
+        response = _get_session().get(url, timeout=30)
         response.raise_for_status()
         html_content = response.text
         logger.info(f'Successfully fetched page. Status code: {response.status_code}')
@@ -324,7 +328,7 @@ def process_url(url, ingestion_id=None):
 
         if report_title_arabic:
             logger.info(f'Report title (Arabic): {report_title_arabic}')
-            report_title_english = translate_text(report_title_arabic)
+            report_title_english = translate_with_minimax(report_title_arabic)
             logger.info(f'Report title (English): {report_title_english}')
             try:
                 report_date = parse_report_date(report_title_arabic)
@@ -355,7 +359,7 @@ def process_url(url, ingestion_id=None):
         categories, values = extract_highcharts_data(soup)
 
         for desc_arabic, value in zip(categories, values):
-            desc_english = custom_translations.get(desc_arabic.strip(), translate_text(desc_arabic.strip()))
+            desc_english = custom_translations.get(desc_arabic.strip(), translate_with_minimax(desc_arabic.strip()))
             desc_english = normalize_translation(desc_english)
 
             logger.info(f'Processing: {desc_arabic} -> {desc_english} with value {value}')
@@ -374,13 +378,15 @@ def process_url(url, ingestion_id=None):
         else:
             logger.warning('Failed to scrape NAD page data')
 
-        insert_report(scraped_data, url, ingestion_id=ingestion_id)
+        inserted = insert_report(scraped_data, url, ingestion_id=ingestion_id)
+        logger.info(f'Scraping process for URL {url} completed.')
+        return inserted
 
     except Exception as e:
         logger.error(f"An unexpected error occurred while processing URL {url}: {str(e)}")
         write_failed_url(url, e)
-
-    logger.info(f'Scraping process for URL {url} completed.')
+        logger.info(f'Scraping process for URL {url} completed.')
+        return False
 
 
 # Main function to execute the script
@@ -404,10 +410,16 @@ def main():
                 for url in url_list
             }
             for i, future in enumerate(as_completed(futures), 1):
+                if _shutdown_requested:
+                    logger.info("Shutdown requested, cancelling remaining tasks.")
+                    for f in futures:
+                        f.cancel()
+                    break
                 url = futures[future]
                 try:
-                    future.result()
-                    records_added += 1
+                    inserted = future.result()
+                    if inserted:
+                        records_added += 1
                     logger.info(f"Completed URL {i}/{len(url_list)}: {url}")
                 except Exception as e:
                     errors += 1
