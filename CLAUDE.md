@@ -27,8 +27,8 @@ python backfill_translations.py [--limit N] [--date YYYY.MM.DD] [--dry-run]
 # Test MiniMax translation quality
 python test_minimax_translation.py [--date YYYY.MM.DD] [--sample N]
 
-# Run migration from MongoDB (one-time)
-python migrations/migrate_from_mongodb.py [--dry-run] [--limit N]
+# Migration from MongoDB (completed, one-time only — kept for reference)
+# python migrations/migrate_from_mongodb.py [--dry-run] [--limit N]
 ```
 
 ## Architecture
@@ -65,11 +65,8 @@ Required (set in .env or GitHub secrets):
 - `DATABASE_URL_POOLED` - Neon Postgres pooled connection string
 - `MINIMAX_API_KEY` - MiniMax API key for translations
 
-Legacy (only needed for migration):
-- `MONGO_URI` - MongoDB connection string or cluster hostname
-- `MONGO_USER` - MongoDB username
-- `MONGO_PASSWORD` - MongoDB password
-- `MONGO_DB_NAME` - Database name
+Legacy (migration completed, no longer needed):
+- MongoDB credentials were used for the one-time migration to Neon Postgres (see `migrations/`). The project now uses Neon exclusively.
 
 ## Adding New Translation Normalizations
 
